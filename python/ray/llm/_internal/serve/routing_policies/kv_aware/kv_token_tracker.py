@@ -11,6 +11,7 @@ import ray
 from ray import serve
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
     DEFAULT_KV_INDEXER_THREADS,
+    DEFAULT_SESSION_AFFINITY_TTL_S,
     KV_INDEXER_THREADS_KEY,
     LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S,
     REQUEST_TRACKING_TTL_S,
@@ -30,11 +31,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(SERVE_LOGGER_NAME)
 
 # Dynamo's selection service keys all worker, indexer, and load state by
-# (model_name, tenant_id). KVTokenTracker instantiates a selection service and
+# (model_name, routing_group). KVTokenTracker instantiates a selection service and
 # serves exactly one model, so a single fixed key scopes all of its workers
 # together.
 _MODEL_NAME = "default"
-_TENANT_ID = "default"
+_ROUTING_GROUP = "default"
 
 # Hooks a replica may invoke through ``KVTokenTracker.on_lifecycle_events``.
 LIFECYCLE_HOOKS = frozenset(
@@ -99,6 +100,8 @@ class ReservationBroadcast(TypedDict):
     # peer's selection service books this reservation in the same LoRA
     # namespace the selecting ingress scored it in.
     lora_name: Optional[str]
+    # Session affinity state shared with peer ingresses.
+    session_binding: Optional[Dict[str, Any]]
 
 
 class ReservationBroadcastForwarder:
@@ -175,14 +178,10 @@ class KVTokenTracker:
        mapping each running replica to a Dynamo worker id.
     3. The ``SelectionService`` maintains a global KV index radix tree, fed by
        every replica's KV events; each node records which workers hold that KV block.
-    4. Scoring (``select_worker``) atomically ranks candidate workers by
-       KV-cache overlap and current token load, reserves the chosen worker, and
-       records local lifecycle state. The selected reservation is replicated to
-       peer ingress replicas in the background so every selection service can
-       apply the engine's subsequent lifecycle events. A separate
-       select-then-reserve flow causes herding because concurrent requests can
-       select the same worker from stale load state before any reservation is
-       visible.
+    4. ``select_worker`` uses session pinning or token-load scoring
+       and books the chosen worker before returning. Reservations and session
+       affinity state propagate through background Serve broadcasts.
+       Engine lifecycle events update each ingress's booked load.
     """
 
     def __init__(
@@ -190,6 +189,7 @@ class KVTokenTracker:
         indexer_threads: int = DEFAULT_KV_INDEXER_THREADS,
         serve_deployment_id: Optional[Any] = None,
         ingress_replica_rank: Optional[int] = None,
+        session_affinity_ttl_s: float = DEFAULT_SESSION_AFFINITY_TTL_S,
     ):
         # The tracked LLMServer deployment id, passed in by the LLMRouter
         # that builds the tracker.
@@ -207,6 +207,7 @@ class KVTokenTracker:
         # track the worker's active load and index its KV blocks for overlap.
         self._block_size: Optional[int] = None
         self._indexer_threads = indexer_threads
+        self._session_affinity_ttl_s = session_affinity_ttl_s
         # _replica_id_by_worker maps a Dynamo worker id to the running replica's full
         # id string, kept in sync with the deployment's live replicas over LongPoll.
         # NOTE (jeffreywang): _replica_id_by_worker is later used by select_worker
@@ -255,7 +256,10 @@ class KVTokenTracker:
             )
             return
 
-        self._svc = SelectionService(indexer_threads=self._indexer_threads)
+        self._svc = SelectionService(
+            indexer_threads=self._indexer_threads,
+            session_affinity_ttl_secs=self._session_affinity_ttl_s or None,
+        )
         logger.info(
             "Dynamo SelectionService created (indexer threads %d).",
             self._indexer_threads,
@@ -383,7 +387,7 @@ class KVTokenTracker:
             {
                 "worker_id": worker_id,
                 "model_name": _MODEL_NAME,
-                "tenant_id": _TENANT_ID,
+                "routing_group": _ROUTING_GROUP,
                 # NOTE: SelectionService requires endpoint to be non-empty although it's left
                 # unused under an external runtime like Ray Serve LLM.
                 # TODO (jeffreywang): Allow empty endpoints upstream.
@@ -416,9 +420,13 @@ class KVTokenTracker:
         allowed_worker_ids: List[int],
         expected_output_tokens: Optional[int] = None,
         lora_name: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> WorkerSelection:
-        """Score the allowed workers for a request based on KV-cache overlap and
-        load and pick the best one.
+        """Select an allowed worker using session pinning, KV-cache overlap,
+        and estimated token load.
+
+        Session requests reuse their selected worker while it remains eligible
+        and session affinity hasn't expired. Every request still reserves load.
 
         Args:
             request_id: Unique identifier for the request being routed.
@@ -431,6 +439,7 @@ class KVTokenTracker:
                 events. The selection service salts its KV hashes with it, so
                 omitting it on a LoRA request scores against the wrong
                 namespace and never matches.
+            session_id: The request's session, if any.
 
         Returns:
             The selected worker (see ``WorkerSelection``).
@@ -448,12 +457,13 @@ class KVTokenTracker:
         await self._evict_stale_requests()
         request = {
             "model_name": _MODEL_NAME,
-            "tenant_id": _TENANT_ID,
+            "routing_group": _ROUTING_GROUP,
             "selection_id": request_id,
             "token_ids": token_ids,
             "allowed_worker_ids": allowed_worker_ids,
             "expected_output_tokens": expected_output_tokens,
             "lora_name": lora_name,
+            "session_id": session_id,
         }
         selection = await self._svc.select_and_reserve(request)
         self._track_request_state(
@@ -474,6 +484,11 @@ class KVTokenTracker:
                     "expected_output_tokens": expected_output_tokens,
                     "effective_prefill_tokens": selection["effective_prefill_tokens"],
                     "lora_name": lora_name,
+                    "session_binding": self._svc.session_binding(
+                        session_id, model_name=_MODEL_NAME, routing_group=_ROUTING_GROUP
+                    )
+                    if session_id
+                    else None,
                 }
             )
         return {
@@ -525,6 +540,10 @@ class KVTokenTracker:
             # request already completed locally before the broadcast arrived.
             if reservation["source_ingress_replica_rank"] == self._ingress_replica_rank:
                 continue
+            # Completion or failed load booking must not discard session affinity.
+            binding = reservation.get("session_binding")
+            if binding is not None:
+                self._svc.apply_session_binding(binding)
             pending.append(reservation)
         if not pending:
             return
@@ -562,7 +581,7 @@ class KVTokenTracker:
             await self._svc.create_reservation(
                 {
                     "model_name": _MODEL_NAME,
-                    "tenant_id": _TENANT_ID,
+                    "routing_group": _ROUTING_GROUP,
                     "selection_id": request_id,
                     "worker_id": reservation["worker_id"],
                     "dp_rank": reservation["dp_rank"],
@@ -719,7 +738,16 @@ def build_kv_token_tracker(
     so the same-process ``KVAwareRouter`` can reach it. Must be called from the
     ingress replica's event loop (the tracker binds a LongPollClient to it).
     """
+    router_config = llm_config.deployment_config.get("request_router_config") or {}
+    router_kwargs = (
+        router_config.get("request_router_kwargs", {})
+        if isinstance(router_config, dict)
+        else router_config.request_router_kwargs
+    )
     tracker = KVTokenTracker(
+        session_affinity_ttl_s=router_kwargs.get(
+            "session_affinity_ttl_s", DEFAULT_SESSION_AFFINITY_TTL_S
+        ),
         indexer_threads=llm_config.experimental_configs.get(
             KV_INDEXER_THREADS_KEY, DEFAULT_KV_INDEXER_THREADS
         ),
